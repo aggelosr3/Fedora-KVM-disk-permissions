@@ -8,3 +8,4 @@ This issue applies to all drives if they are not properly mounted.
 The script is still in testing phase, as I was trying to fix the KVM-related problem.
 
 If you decide to try it, you do so at your own risk. I strongly recommend testing it inside a VM first, if possible.
+I use it only on Fedora
