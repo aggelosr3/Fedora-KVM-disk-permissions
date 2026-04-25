@@ -1,0 +1,430 @@
+#!/bin/bash
+# ============================================================
+# kvm-disk-manager.sh
+# Disk Manager για KVM/QEMU - Fedora
+# Δημιουργήθηκε: 2026-04-25
+# ============================================================
+
+# --- Χρώματα ---
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+# --- Βοηθητικές συναρτήσεις ---
+info()    { echo -e "${BLUE}[INFO]${NC} $1"; }
+success() { echo -e "${GREEN}[✔]${NC} $1"; }
+warn()    { echo -e "${YELLOW}[⚠]${NC} $1"; }
+error()   { echo -e "${RED}[✘]${NC} $1"; }
+step()    { echo -e "${CYAN}[→]${NC} $1"; }
+
+ask_confirm() {
+    # $1 = μήνυμα
+    echo ""
+    echo -e "${YELLOW}Τι θα γίνει:${NC} $1"
+    echo -ne "${BOLD}Συνεχίζω; [y/N]: ${NC}"
+    read -r answer
+    [[ "$answer" =~ ^[Yy]$ ]]
+}
+
+# ============================================================
+# CHECK 1: Τρέχει ως root;
+# ============================================================
+check_root() {
+    step "Έλεγχος αν τρέχεις με sudo..."
+    if [[ $EUID -ne 0 ]]; then
+        error "Το script χρειάζεται sudo."
+        echo -e "  Τρέξε: ${BOLD}sudo bash kvm-disk-manager.sh${NC}"
+        exit 1
+    fi
+    success "Τρέχει με root δικαιώματα."
+}
+
+# ============================================================
+# CHECK 2: Απαιτούμενα εργαλεία
+# ============================================================
+check_dependencies() {
+    step "Έλεγχος απαιτούμενων εργαλείων (lsblk, ntfs-3g, setfacl, libvirtd)..."
+    local missing=()
+
+    for tool in lsblk ntfs-3g setfacl libvirtd; do
+        if ! command -v "$tool" &>/dev/null; then
+            missing+=("$tool")
+        fi
+    done
+
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        warn "Λείπουν τα παρακάτω εργαλεία: ${missing[*]}"
+        if ask_confirm "Θα εγκατασταθούν τα εργαλεία: ${missing[*]} με dnf install"; then
+            dnf install -y ntfs-3g acl libvirt &>/dev/null
+            success "Εγκαταστάθηκαν."
+        else
+            error "Δεν μπορώ να συνεχίσω χωρίς τα απαιτούμενα εργαλεία."
+            exit 1
+        fi
+    else
+        success "Όλα τα εργαλεία είναι διαθέσιμα."
+    fi
+}
+
+# ============================================================
+# CHECK 3: libvirtd τρέχει;
+# ============================================================
+check_libvirtd() {
+    step "Έλεγχος αν το libvirtd τρέχει..."
+    if ! systemctl is-active --quiet libvirtd; then
+        warn "Το libvirtd δεν τρέχει."
+        if ask_confirm "Θα ενεργοποιηθεί το libvirtd (systemctl enable --now libvirtd)"; then
+            systemctl enable --now libvirtd
+            success "libvirtd ενεργοποιήθηκε."
+        else
+            warn "Συνεχίζω χωρίς libvirtd..."
+        fi
+    else
+        success "libvirtd τρέχει κανονικά."
+    fi
+}
+
+# ============================================================
+# CHECK 4: qemu user υπάρχει;
+# ============================================================
+check_qemu_user() {
+    step "Έλεγχος αν ο qemu user υπάρχει στο σύστημα..."
+    if ! id "qemu" &>/dev/null; then
+        error "Ο qemu user δεν βρέθηκε. Βεβαιώσου ότι το KVM/QEMU είναι εγκατεστημένο."
+        exit 1
+    fi
+    success "qemu user βρέθηκε (uid=$(id -u qemu))."
+}
+
+# ============================================================
+# ΒΗΜΑ 1: Σάρωση δίσκων
+# ============================================================
+scan_disks() {
+    step "Σαρώνω δίσκους στο σύστημα..."
+    echo ""
+
+    # Παίρνουμε partitions με FSTYPE (ntfs ή ext4) που ΔΕΝ είναι system
+    mapfile -t DEVICES < <(lsblk -rno NAME,FSTYPE,LABEL,SIZE,MOUNTPOINT | \
+        awk '$2 ~ /^(ntfs|ext4|ext3|exfat|vfat)$/ && $1 !~ /^(nvme0|zram)/' )
+
+    if [[ ${#DEVICES[@]} -eq 0 ]]; then
+        error "Δεν βρέθηκαν δίσκοι με NTFS ή ext4."
+        exit 1
+    fi
+
+    echo -e "${BOLD}╔══════════════════════════════════════════════════════╗${NC}"
+    echo -e "${BOLD}║           Διαθέσιμοι Δίσκοι                         ║${NC}"
+    echo -e "${BOLD}╠══════╦══════════╦══════════════╦════════╦════════════╣${NC}"
+    printf "${BOLD}║ %-4s ║ %-8s ║ %-12s ║ %-6s ║ %-10s ║${NC}\n" "#" "Device" "Label" "Size" "Mounted"
+    echo -e "${BOLD}╠══════╬══════════╬══════════════╬════════╬════════════╣${NC}"
+
+    DISK_LIST=()
+    local i=1
+    for entry in "${DEVICES[@]}"; do
+        read -r name fstype label size mountpoint <<< "$entry"
+        [[ -z "$label" ]] && label="-"
+        [[ -z "$mountpoint" ]] && mountpoint="No"
+
+        # Χρώμα ανά τύπο
+        if [[ "$fstype" == "ntfs" ]]; then
+            COLOR="${YELLOW}"
+        else
+            COLOR="${GREEN}"
+        fi
+
+        printf "║ ${BOLD}%-4s${NC} ║ ${COLOR}%-8s${NC} ║ %-12s ║ %-6s ║ %-10s ║\n" \
+            "$i" "$name" "$label" "$size" "$mountpoint"
+
+        DISK_LIST+=("$name|$fstype|$label|$size|$mountpoint")
+        ((i++))
+    done
+
+    echo -e "${BOLD}╚══════╩══════════╩══════════════╩════════╩════════════╝${NC}"
+    echo ""
+}
+
+# ============================================================
+# ΒΗΜΑ 2: Επιλογή δίσκου
+# ============================================================
+select_disk() {
+    local max=${#DISK_LIST[@]}
+    echo -ne "${BOLD}Επέλεξε δίσκο [1-$max]: ${NC}"
+    read -r choice
+
+    # Check: έγκυρος αριθμός;
+    if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > max )); then
+        error "Μη έγκυρη επιλογή: '$choice'. Παρακαλώ επέλεξε αριθμό από 1 έως $max."
+        exit 1
+    fi
+
+    SELECTED="${DISK_LIST[$((choice-1))]}"
+    IFS='|' read -r SEL_NAME SEL_FSTYPE SEL_LABEL SEL_SIZE SEL_MOUNT <<< "$SELECTED"
+
+    echo ""
+    echo -e "${BOLD}Επιλέχθηκε:${NC}"
+    echo -e "  Device : ${CYAN}/dev/$SEL_NAME${NC}"
+    echo -e "  Τύπος  : ${CYAN}$SEL_FSTYPE${NC}"
+    echo -e "  Label  : ${CYAN}$SEL_LABEL${NC}"
+    echo -e "  Μέγεθος: ${CYAN}$SEL_SIZE${NC}"
+    echo -e "  Mounted: ${CYAN}$SEL_MOUNT${NC}"
+}
+
+# ============================================================
+# ΒΗΜΑ 3: Mount δίσκου
+# ============================================================
+mount_disk() {
+    # Παίρνουμε το ΠΡΑΓΜΑΤΙΚΟ mountpoint από lsblk (χειρίζεται spaces σωστά)
+    REAL_MOUNT=$(lsblk -rno MOUNTPOINT "/dev/$SEL_NAME" 2>/dev/null | grep -v '^$' | head -1)
+
+    # Check: ήδη mounted;
+    if [[ -n "$REAL_MOUNT" && -d "$REAL_MOUNT" ]]; then
+        success "Ο δίσκος είναι ήδη mounted στο: $REAL_MOUNT"
+        MOUNT_POINT="$REAL_MOUNT"
+        return
+    fi
+
+    # Νέο mount point χωρίς spaces ή special characters
+    CLEAN_LABEL=$(echo "$SEL_LABEL" | tr '[:upper:]' '[:lower:]' | tr ' ' '_' | tr -dc '[:alnum:]_-')
+    [[ -z "$CLEAN_LABEL" ]] && CLEAN_LABEL="$SEL_NAME"
+    MOUNT_POINT="/mnt/kvm-${CLEAN_LABEL}"
+
+
+    # Ενημέρωση χρήστη
+    echo ""
+    if [[ "$SEL_FSTYPE" == "ntfs" ]]; then
+        MSG="Ο δίσκος /dev/$SEL_NAME (NTFS) θα γίνει mount στο $MOUNT_POINT με ntfs-3g.\nΘα έχεις read/write πρόσβαση ως $(logname)."
+    else
+        MSG="Ο δίσκος /dev/$SEL_NAME ($SEL_FSTYPE) θα γίνει mount στο $MOUNT_POINT."
+    fi
+
+    if ask_confirm "$MSG"; then
+        # Check: mount point υπάρχει;
+        if [[ ! -d "$MOUNT_POINT" ]]; then
+            mkdir -p "$MOUNT_POINT"
+            success "Δημιουργήθηκε το $MOUNT_POINT"
+        fi
+
+        # Mount ανάλογα με τύπο
+        if [[ "$SEL_FSTYPE" == "ntfs" ]]; then
+            if mount -t ntfs-3g -o uid="$(id -u "$(logname)")",gid="$(id -g "$(logname)")",rw,remove_hiberfile \
+                "/dev/$SEL_NAME" "$MOUNT_POINT"; then
+                success "Mount επιτυχές στο $MOUNT_POINT"
+            else
+                error "Mount απέτυχε. Δοκίμασε να κλείσεις τα Windows και να απενεργοποιήσεις το Fast Startup."
+                exit 1
+            fi
+        else
+            if mount "/dev/$SEL_NAME" "$MOUNT_POINT"; then
+                success "Mount επιτυχές στο $MOUNT_POINT"
+            else
+                error "Mount απέτυχε."
+                exit 1
+            fi
+        fi
+    else
+        warn "Ακυρώθηκε. Έξοδος."
+        exit 0
+    fi
+}
+
+# ============================================================
+# ΒΗΜΑ 4: Δικαιώματα για KVM/QEMU
+# ============================================================
+set_kvm_permissions() {
+    echo ""
+    if ask_confirm "Θα δοθούν δικαιώματα read/write/execute στον qemu user για το $MOUNT_POINT.\nΑυτό χρειάζεται για να τρέχει το virt-manager χωρίς Permission Denied."; then
+
+        # Check: setfacl διαθέσιμο;
+        if ! command -v setfacl &>/dev/null; then
+            error "Το setfacl δεν βρέθηκε."
+            exit 1
+        fi
+
+        # Check: το path υπάρχει πραγματικά;
+        if [[ ! -d "$MOUNT_POINT" ]]; then
+            error "Το path '$MOUNT_POINT' δεν βρέθηκε. Βεβαιώσου ότι ο δίσκος είναι mounted."
+            exit 1
+        fi
+
+        # Εκτέλεση setfacl με quoted path
+        if setfacl -R -m u:qemu:rwx "$MOUNT_POINT"; then
+            success "Δικαιώματα qemu:rwx δόθηκαν στο $MOUNT_POINT"
+        else
+            error "setfacl απέτυχε στο '$MOUNT_POINT'"
+            exit 1
+        fi
+
+        # Δικαιώματα και στο parent directory
+        PARENT=$(dirname "$MOUNT_POINT")
+        if setfacl -m u:qemu:rx "$PARENT"; then
+            success "Δικαιώματα qemu:rx δόθηκαν στο $PARENT"
+        else
+            warn "setfacl στο parent '$PARENT' απέτυχε (μη κρίσιμο)."
+        fi
+    else
+        warn "Παραλείφθηκε το βήμα δικαιωμάτων."
+    fi
+}
+
+# ============================================================
+# ΒΗΜΑ 5: Ενημέρωση qemu.conf
+# ============================================================
+update_qemu_conf() {
+    local conf="/etc/libvirt/qemu.conf"
+    local current_user
+    current_user=$(logname)
+
+    echo ""
+
+    # Check: αρχείο υπάρχει;
+    if [[ ! -f "$conf" ]]; then
+        error "Δεν βρέθηκε το $conf. Είναι εγκατεστημένο το libvirt;"
+        exit 1
+    fi
+
+    if ask_confirm "Το $conf θα ενημερωθεί ώστε ο QEMU να τρέχει ως user='$current_user' και group='libvirt'.\nΑυτό λύνει το 'Permission Denied (uid:107)' error στο virt-manager."; then
+
+        # Backup πρώτα
+        cp "$conf" "${conf}.bak.$(date +%Y%m%d%H%M%S)"
+        success "Backup δημιουργήθηκε: ${conf}.bak.*"
+
+        # Check: γραμμές υπάρχουν;
+        if grep -q '^#user' "$conf" || grep -q '^user' "$conf"; then
+            sed -i "s/^#*user\s*=.*/user = \"$current_user\"/" "$conf"
+        else
+            echo "user = \"$current_user\"" >> "$conf"
+        fi
+
+        if grep -q '^#group' "$conf" || grep -q '^group' "$conf"; then
+            sed -i 's/^#*group\s*=.*/group = "libvirt"/' "$conf"
+        else
+            echo 'group = "libvirt"' >> "$conf"
+        fi
+
+        success "qemu.conf ενημερώθηκε (user=$current_user, group=libvirt)"
+
+        # Restart libvirtd
+        if ask_confirm "Θα γίνει restart το libvirtd για να πάρει effect η αλλαγή."; then
+            systemctl restart libvirtd
+            # Check: restart πέτυχε;
+            if systemctl is-active --quiet libvirtd; then
+                success "libvirtd επανεκκινήθηκε επιτυχώς."
+            else
+                error "libvirtd δεν εκκινήθηκε σωστά. Τρέξε: journalctl -xe"
+                exit 1
+            fi
+        fi
+    else
+        warn "Παραλείφθηκε η ενημέρωση qemu.conf."
+    fi
+}
+
+# ============================================================
+# ΒΗΜΑ 6: Επαλήθευση λειτουργίας
+# ============================================================
+verify_all() {
+    echo ""
+    step "Εκτελώ τελικό έλεγχο λειτουργίας..."
+    echo ""
+
+    local all_ok=true
+
+    # Check 1: Mount point υπάρχει και έχει περιεχόμενο
+    if mountpoint -q "$MOUNT_POINT" 2>/dev/null; then
+        success "Mount: $MOUNT_POINT → mounted ✔"
+    else
+        # Ίσως είναι ήδη mounted από GNOME (π.χ. /run/media/...)
+        if [[ -d "$MOUNT_POINT" ]]; then
+            success "Mount: $MOUNT_POINT → directory υπάρχει ✔"
+        else
+            error "Mount: $MOUNT_POINT → ΔΕΝ βρέθηκε ✘"
+            all_ok=false
+        fi
+    fi
+
+    # Check 2: qemu ACL
+    if getfacl "$MOUNT_POINT" 2>/dev/null | grep -q "user:qemu:rwx"; then
+        success "qemu ACL: rwx ✔"
+    else
+        warn "qemu ACL: δεν επαληθεύτηκε (μπορεί να είναι OK αν χρησιμοποιείς qemu.conf)"
+    fi
+
+    # Check 3: libvirtd τρέχει
+    if systemctl is-active --quiet libvirtd; then
+        success "libvirtd: τρέχει ✔"
+    else
+        error "libvirtd: ΔΕΝ τρέχει ✘"
+        all_ok=false
+    fi
+
+    # Check 4: qemu.conf user
+    local conf="/etc/libvirt/qemu.conf"
+    if grep -q "^user" "$conf" 2>/dev/null; then
+        local conf_user
+        conf_user=$(grep "^user" "$conf" | head -1)
+        success "qemu.conf: $conf_user ✔"
+    else
+        warn "qemu.conf: user γραμμή δεν βρέθηκε"
+    fi
+
+    # Check 5: Δοκιμαστική εγγραφή
+    local testfile="$MOUNT_POINT/.kvm_write_test"
+    if touch "$testfile" 2>/dev/null; then
+        rm -f "$testfile"
+        success "Δοκιμαστική εγγραφή: $MOUNT_POINT → OK ✔"
+    else
+        error "Δοκιμαστική εγγραφή: $MOUNT_POINT → ΑΠΟΤΥΧΙΑ ✘"
+        all_ok=false
+    fi
+
+    echo ""
+    if [[ "$all_ok" == true ]]; then
+        echo -e "${GREEN}${BOLD}✅ Όλοι οι έλεγχοι πέρασαν! Το virt-manager είναι έτοιμο.${NC}"
+    else
+        echo -e "${RED}${BOLD}⚠ Κάποιοι έλεγχοι απέτυχαν. Δες τα errors παραπάνω.${NC}"
+    fi
+}
+
+# ============================================================
+# ΒΗΜΑ 7: Τελική αναφορά
+# ============================================================
+final_report() {
+    echo ""
+    echo -e "${BOLD}╔══════════════════════════════════════════════╗${NC}"
+    echo -e "${BOLD}║           ✅ Ολοκληρώθηκε                   ║${NC}"
+    echo -e "${BOLD}╠══════════════════════════════════════════════╣${NC}"
+    echo -e "║ Device    : ${CYAN}/dev/$SEL_NAME${NC}"
+    echo -e "║ Mount     : ${CYAN}$MOUNT_POINT${NC}"
+    echo -e "║ Τύπος     : ${CYAN}$SEL_FSTYPE${NC}"
+    echo -e "${BOLD}╠══════════════════════════════════════════════╣${NC}"
+    echo -e "║ Στο virt-manager χρησιμοποίησε το path:     ║"
+    echo -e "║ ${CYAN}$MOUNT_POINT${NC}"
+    echo -e "${BOLD}╚══════════════════════════════════════════════╝${NC}"
+    echo ""
+}
+
+# ============================================================
+# ΚΥΡΙΟ ΠΡΟΓΡΑΜΜΑ
+# ============================================================
+clear
+echo -e "${BOLD}╔══════════════════════════════════════════════╗${NC}"
+echo -e "${BOLD}║     KVM Disk Manager για Fedora              ║${NC}"
+echo -e "${BOLD}║     Δημιουργήθηκε: 2026-04-25               ║${NC}"
+echo -e "${BOLD}╚══════════════════════════════════════════════╝${NC}"
+echo ""
+
+check_root
+check_dependencies
+check_libvirtd
+check_qemu_user
+scan_disks
+select_disk
+mount_disk
+set_kvm_permissions
+update_qemu_conf
+verify_all
+final_report
