@@ -101,63 +101,152 @@ check_qemu_user() {
 }
 
 # ============================================================
-# ΒΗΜΑ 1: Σάρωση δίσκων
+# Έλεγχος αν partition πρέπει να παραλειφθεί
 # ============================================================
-scan_disks() {
-    step "Σαρώνω δίσκους στο σύστημα..."
-    echo ""
+should_skip() {
+    local name="$1" fstype="$2" label="$3"
 
-    # Παίρνουμε partitions με FSTYPE (ntfs ή ext4) που ΔΕΝ είναι system
-    mapfile -t DEVICES < <(lsblk -rno NAME,FSTYPE,LABEL,SIZE,MOUNTPOINT | \
-        awk '$2 ~ /^(ntfs|ext4|ext3|exfat|vfat)$/ && $1 !~ /^(nvme0|zram)/' )
-
-    if [[ ${#DEVICES[@]} -eq 0 ]]; then
-        error "Δεν βρέθηκαν δίσκοι με NTFS ή ext4."
-        exit 1
+    # Check: whole disk (sda/sdb/sdd χωρίς partition number) → skip
+    if [[ "$name" =~ ^(sd[a-z]|hd[a-z]|nvme[0-9]+n[0-9]+)$ ]]; then
+        echo "Whole disk - όχι partition"
+        return 0
     fi
 
-    echo -e "${BOLD}╔══════════════════════════════════════════════════════╗${NC}"
-    echo -e "${BOLD}║           Διαθέσιμοι Δίσκοι                         ║${NC}"
-    echo -e "${BOLD}╠══════╦══════════╦══════════════╦════════╦════════════╣${NC}"
-    printf "${BOLD}║ %-4s ║ %-8s ║ %-12s ║ %-6s ║ %-10s ║${NC}\n" "#" "Device" "Label" "Size" "Mounted"
-    echo -e "${BOLD}╠══════╬══════════╬══════════════╬════════╬════════════╣${NC}"
+    # Check: χωρίς filesystem → skip
+    if [[ -z "$fstype" || "$fstype" == "-" ]]; then
+        echo "Χωρίς filesystem (GPT/unformatted)"
+        return 0
+    fi
 
-    DISK_LIST=()
-    local i=1
-    for entry in "${DEVICES[@]}"; do
-        read -r name fstype label size mountpoint <<< "$entry"
-        [[ -z "$label" ]] && label="-"
-        [[ -z "$mountpoint" ]] && mountpoint="No"
+    # Check: EFI/vfat system partitions → skip
+    if [[ "$fstype" == "vfat" ]]; then
+        echo "EFI/vfat partition (boot) - μην αγγίζεις"
+        return 0
+    fi
 
-        # Χρώμα ανά τύπο
-        if [[ "$fstype" == "ntfs" ]]; then
-            COLOR="${YELLOW}"
-        else
-            COLOR="${GREEN}"
-        fi
+    # Check: Recovery partition → skip (Windows recovery - μην χαλάσεις)
+    if echo "$label" | grep -qi "recovery"; then
+        echo "Windows Recovery partition - μην αγγίζεις"
+        return 0
+    fi
 
-        printf "║ ${BOLD}%-4s${NC} ║ ${COLOR}%-8s${NC} ║ %-12s ║ %-6s ║ %-10s ║\n" \
-            "$i" "$name" "$label" "$size" "$mountpoint"
+    # Check: swap → skip
+    if [[ "$fstype" == "swap" ]]; then
+        echo "Swap partition"
+        return 0
+    fi
 
-        DISK_LIST+=("$name|$fstype|$label|$size|$mountpoint")
-        ((i++))
-    done
+    # Check: system nvme0 (Fedora OS disk) → skip
+    if echo "$name" | grep -q "^nvme0"; then
+        echo "Fedora system disk (nvme0) - μην αγγίζεις"
+        return 0
+    fi
 
-    echo -e "${BOLD}╚══════╩══════════╩══════════════╩════════╩════════════╝${NC}"
-    echo ""
+    # Check: zram → skip
+    if echo "$name" | grep -q "^zram"; then
+        echo "zram (swap) - skip"
+        return 0
+    fi
+
+    # Check: ήδη στο fstab → skip
+    if grep -q "/dev/$name" "$FSTAB" 2>/dev/null; then
+        echo "Ήδη στο fstab"
+        return 0
+    fi
+
+    return 1
 }
 
 # ============================================================
-# ΒΗΜΑ 2: Επιλογή δίσκου
+# ΒΗΜΑ 1: Σάρωση δίσκων
 # ============================================================
+scan_disks() {
+    step "Σαρώνω όλους τους δίσκους..."
+    echo ""
+
+    # Παίρνουμε ΟΛΑ τα partitions με separator | για ασφαλές parsing
+    mapfile -t ALL_DEVICES < <(lsblk -rno NAME,FSTYPE,LABEL,SIZE,MOUNTPOINT -P |         sed "s/NAME=//g;s/FSTYPE=//g;s/LABEL=//g;s/SIZE=//g;s/MOUNTPOINT=//g" |         sed 's/" "/|/g;s/"//g')
+
+    # Fallback αν το -P δεν δουλεύει
+    if [[ ${#ALL_DEVICES[@]} -eq 0 ]]; then
+        mapfile -t ALL_DEVICES < <(lsblk -rno NAME,FSTYPE,LABEL,SIZE,MOUNTPOINT)
+    fi
+
+    if [[ ${#ALL_DEVICES[@]} -eq 0 ]]; then
+        error "Δεν βρέθηκαν δίσκοι."
+        exit 1
+    fi
+
+    echo -e "${BOLD}╔════╦════════════╦════════╦═══════════════╦════════╦══════════════════════════════════╗${NC}"
+    printf "${BOLD}║ %-2s ║ %-10s ║ %-6s ║ %-13s ║ %-6s ║ %-32s ║${NC}
+" "#" "Device" "Type" "Label" "Size" "Status"
+    echo -e "${BOLD}╠════╬════════════╬════════╬═══════════════╬════════╬══════════════════════════════════╣${NC}"
+
+    DISK_LIST=()
+    local i=1
+    for entry in "${ALL_DEVICES[@]}"; do
+        # Robust parsing: NAME FSTYPE LABEL SIZE MOUNTPOINT
+        name=$(echo "$entry"     | awk "{print \$1}")
+        fstype=$(echo "$entry"   | awk "{print \$2}")
+        label=$(echo "$entry"    | awk "{print \$3}")
+        size=$(echo "$entry"     | awk "{print \$4}")
+        mountpoint=$(echo "$entry" | awk "{print \$5}")
+        [[ -z "$label" || "$label" == "-" ]]      && label="-"
+        [[ -z "$fstype" || "$fstype" == "-" ]]    && fstype="-"
+        [[ -z "$mountpoint" || "$mountpoint" == "-" ]] && mountpoint="-"
+
+        local skip_reason
+        skip_reason=$(should_skip "$name" "$fstype" "$label")
+
+        if [[ -n "$skip_reason" ]]; then
+            # Εμφάνισε ως SKIP με αιτία
+            printf "║ ${YELLOW}%-2s${NC} ║ %-10s ║ %-6s ║ %-13s ║ %-6s ║ ${YELLOW}SKIP: %-26s${NC} ║
+"                 "-" "$name" "$fstype" "${label:0:13}" "$size" "${skip_reason:0:26}"
+        else
+            # Εμφάνισε ως διαθέσιμο
+            if [[ "$fstype" == "ntfs" ]]; then
+                COLOR="${YELLOW}"
+            else
+                COLOR="${GREEN}"
+            fi
+            printf "║ ${BOLD}${COLOR}%-2s${NC} ║ ${COLOR}%-10s${NC} ║ ${COLOR}%-6s${NC} ║ %-13s ║ %-6s ║ ${GREEN}%-32s${NC} ║
+"                 "$i" "$name" "$fstype" "${label:0:13}" "$size" "Διαθέσιμος"
+            DISK_LIST+=("$name|$fstype|$label|$size|$mountpoint")
+            ((i++))
+        fi
+    done
+
+    echo -e "${BOLD}╚════╩════════════╩════════╩═══════════════╩════════╩══════════════════════════════════╝${NC}"
+    echo ""
+
+    if [[ ${#DISK_LIST[@]} -eq 0 ]]; then
+        success "Όλοι οι κατάλληλοι δίσκοι είναι ήδη ρυθμισμένοι."
+        exit 0
+    fi
+}
+
+# ============================================================
+# ΒΗΜΑ 2: Επιλογή δίσκου (ή όλοι)
+# ============================================================
+SELECT_ALL=false
+
 select_disk() {
     local max=${#DISK_LIST[@]}
-    echo -ne "${BOLD}Επέλεξε δίσκο [1-$max]: ${NC}"
+    echo -ne "${BOLD}Επέλεξε δίσκο [1-$max] ή [a] για ΟΛΟΥΣ: ${NC}"
     read -r choice
+
+    if [[ "$choice" =~ ^[Aa]$ ]]; then
+        SELECT_ALL=true
+        echo ""
+        success "Επιλέχθηκαν ΟΛΟΙ οι διαθέσιμοι δίσκοι ($max σύνολο)."
+        # Για το KVM setup χρησιμοποιούμε τον πρώτο ως SEL_*
+        IFS='|' read -r SEL_NAME SEL_FSTYPE SEL_LABEL SEL_SIZE SEL_MOUNT <<< "${DISK_LIST[0]}"
+        return
+    fi
 
     # Check: έγκυρος αριθμός;
     if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > max )); then
-        error "Μη έγκυρη επιλογή: '$choice'. Παρακαλώ επέλεξε αριθμό από 1 έως $max."
+        error "Μη έγκυρη επιλογή: '$choice'. Επέλεξε αριθμό 1-$max ή 'a' για όλους."
         exit 1
     fi
 
@@ -189,8 +278,12 @@ mount_disk() {
 
     # Νέο mount point χωρίς spaces ή special characters
     CLEAN_LABEL=$(echo "$SEL_LABEL" | tr '[:upper:]' '[:lower:]' | tr ' ' '_' | tr -dc '[:alnum:]_-')
-    [[ -z "$CLEAN_LABEL" ]] && CLEAN_LABEL="$SEL_NAME"
+    # Check: αν label κενό ή μόνο παύλες → χρησιμοποίησε το device name
+    CLEAN_LABEL=$(echo "$CLEAN_LABEL" | tr -d '-')
+    [[ -z "$CLEAN_LABEL" ]] && CLEAN_LABEL=$(echo "$SEL_NAME" | tr -dc '[:alnum:]_')
     MOUNT_POINT="/mnt/kvm-${CLEAN_LABEL}"
+    # Check: mount point δεν είναι κενό
+    [[ -z "$CLEAN_LABEL" ]] && CLEAN_LABEL="disk-$(date +%s)" && MOUNT_POINT="/mnt/kvm-${CLEAN_LABEL}"
 
 
     # Ενημέρωση χρήστη
@@ -214,20 +307,37 @@ mount_disk() {
                 "/dev/$SEL_NAME" "$MOUNT_POINT"; then
                 success "Mount επιτυχές στο $MOUNT_POINT"
             else
-                error "Mount απέτυχε. Δοκίμασε να κλείσεις τα Windows και να απενεργοποιήσεις το Fast Startup."
-                exit 1
+                echo ""
+                echo -e "${RED}[✘]${NC} Mount απέτυχε για /dev/$SEL_NAME"
+                echo ""
+                echo -e "${YELLOW}╔══════════════════════════════════════════════════════╗${NC}"
+                echo -e "${YELLOW}║  ⚠ Πιθανό πρόβλημα: Windows Fast Startup/Hibernate  ║${NC}"
+                echo -e "${YELLOW}╠══════════════════════════════════════════════════════╣${NC}"
+                echo -e "${YELLOW}║  Αν μπήκες πρόσφατα σε Windows:                     ║${NC}"
+                echo -e "${YELLOW}║                                                      ║${NC}"
+                echo -e "${YELLOW}║  1. Μπες Windows                                     ║${NC}"
+                echo -e "${YELLOW}║  2. Control Panel → Power Options                    ║${NC}"
+                echo -e "${YELLOW}║  3. Απενεργοποίησε: Turn on fast startup             ║${NC}"
+                echo -e "${YELLOW}║  4. Κάνε FULL Shutdown (όχι Restart)                 ║${NC}"
+                echo -e "${YELLOW}║  5. Επανέλαβε το mount                               ║${NC}"
+                echo -e "${YELLOW}╚══════════════════════════════════════════════════════╝${NC}"
+                echo ""
+                MOUNT_POINT=""
+                return 1
             fi
         else
             if mount "/dev/$SEL_NAME" "$MOUNT_POINT"; then
                 success "Mount επιτυχές στο $MOUNT_POINT"
             else
-                error "Mount απέτυχε."
-                exit 1
+                error "Mount απέτυχε για /dev/$SEL_NAME."
+                MOUNT_POINT=""
+                return 1
             fi
         fi
     else
-        warn "Ακυρώθηκε. Έξοδος."
-        exit 0
+        warn "Ακυρώθηκε. Παραλείπω αυτόν τον δίσκο."
+        MOUNT_POINT=""
+        return 1
     fi
 }
 
@@ -235,6 +345,11 @@ mount_disk() {
 # ΒΗΜΑ 4: Δικαιώματα για KVM/QEMU
 # ============================================================
 set_kvm_permissions() {
+    # Check: αν δεν έγινε mount → παραλείπω
+    if [[ -z "$MOUNT_POINT" ]]; then
+        warn "Παραλείπω permissions — δεν υπάρχει mounted δίσκος."
+        return
+    fi
     echo ""
     if ask_confirm "Θα δοθούν δικαιώματα read/write/execute στον qemu user για το $MOUNT_POINT.\nΑυτό χρειάζεται για να τρέχει το virt-manager χωρίς Permission Denied."; then
 
@@ -324,7 +439,275 @@ update_qemu_conf() {
 }
 
 # ============================================================
-# ΒΗΜΑ 6: Επαλήθευση λειτουργίας
+# BACKUP MANAGER
+# ============================================================
+BACKUP_DIR="/etc/fstab-backups"
+FSTAB="/etc/fstab"
+MAX_BACKUPS=10
+
+fstab_backup() {
+    # Δημιουργία backup directory αν δεν υπάρχει
+    mkdir -p "$BACKUP_DIR"
+
+    local backup_file="$BACKUP_DIR/fstab.bak.$(date +%Y%m%d-%H%M%S)"
+
+    # Check: fstab υπάρχει;
+    if [[ ! -f "$FSTAB" ]]; then
+        error "Το $FSTAB δεν βρέθηκε!"
+        exit 1
+    fi
+
+    cp "$FSTAB" "$backup_file"
+
+    # Check: backup γράφτηκε;
+    if [[ ! -f "$backup_file" ]]; then
+        error "Backup απέτυχε: $backup_file"
+        exit 1
+    fi
+
+    success "Backup δημιουργήθηκε: $backup_file"
+
+    # Κράτα μόνο τα τελευταία MAX_BACKUPS
+    local count
+    count=$(ls -1 "$BACKUP_DIR"/fstab.bak.* 2>/dev/null | wc -l)
+    if (( count > MAX_BACKUPS )); then
+        ls -1t "$BACKUP_DIR"/fstab.bak.* | tail -n +$((MAX_BACKUPS+1)) | xargs rm -f
+        success "Παλιά backups καθαρίστηκαν (κρατάω τα $MAX_BACKUPS πιο πρόσφατα)."
+    fi
+}
+
+fstab_restore() {
+    echo ""
+    step "=== Restore fstab από backup ==="
+
+    # Check: υπάρχουν backups;
+    if [[ ! -d "$BACKUP_DIR" ]] || [[ -z "$(ls -A "$BACKUP_DIR" 2>/dev/null)" ]]; then
+        error "Δεν βρέθηκαν backups στο $BACKUP_DIR"
+        return
+    fi
+
+    echo ""
+    echo -e "${BOLD}Διαθέσιμα backups:${NC}"
+    local i=1
+    local files=()
+    while IFS= read -r f; do
+        local ts
+        ts=$(stat -c '%y' "$f" 2>/dev/null | cut -d'.' -f1)
+        printf "  [%s] %s  (%s)
+" "$i" "$(basename "$f")" "$ts"
+        files+=("$f")
+        ((i++))
+    done < <(ls -1t "$BACKUP_DIR"/fstab.bak.* 2>/dev/null)
+
+    echo ""
+    echo -ne "${BOLD}Ποιο να κάνω restore; [1-${#files[@]}] ή [q] για έξοδο: ${NC}"
+    read -r choice
+
+    # Check: έγκυρη επιλογή;
+    if [[ "$choice" == "q" ]]; then
+        warn "Ακύρωση restore."
+        return
+    fi
+    if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#files[@]} )); then
+        error "Μη έγκυρη επιλογή."
+        return
+    fi
+
+    local selected="${files[$((choice-1))]}"
+    echo ""
+    echo -e "${YELLOW}Τι θα γίνει:${NC}"
+    echo -e "  Το τρέχον $FSTAB θα αντικατασταθεί"
+    echo -e "  από το: ${CYAN}$(basename "$selected")${NC}"
+    echo -e "  Θα τρέξει: systemctl daemon-reload"
+    echo ""
+    echo -ne "${BOLD}Συνεχίζω; [y/N]: ${NC}"
+    read -r ans
+
+    if [[ "$ans" =~ ^[Yy]$ ]]; then
+        # Backup του τρέχοντος πριν το restore
+        fstab_backup
+        cp "$selected" "$FSTAB"
+        # Check: αντιγράφηκε σωστά;
+        if diff -q "$selected" "$FSTAB" &>/dev/null; then
+            success "Restore ολοκληρώθηκε από: $(basename "$selected")"
+            systemctl daemon-reload
+            success "systemctl daemon-reload ολοκληρώθηκε."
+        else
+            error "Restore απέτυχε — τα αρχεία διαφέρουν."
+        fi
+    else
+        warn "Restore ακυρώθηκε."
+    fi
+}
+
+backup_menu() {
+    echo ""
+    echo -e "${BOLD}╔══════════════════════════════════════════════╗${NC}"
+    echo -e "${BOLD}║         Backup Manager - /etc/fstab          ║${NC}"
+    echo -e "${BOLD}╠══════════════════════════════════════════════╣${NC}"
+
+    # Εμφάνισε υπάρχοντα backups
+    if [[ -d "$BACKUP_DIR" ]] && ls "$BACKUP_DIR"/fstab.bak.* &>/dev/null; then
+        echo -e "║ Υπάρχοντα backups:                           ║"
+        while IFS= read -r f; do
+            local ts
+            ts=$(stat -c '%y' "$f" 2>/dev/null | cut -d'.' -f1)
+            printf "║   %-42s ║
+" "$(basename "$f") ($ts)"
+        done < <(ls -1t "$BACKUP_DIR"/fstab.bak.* 2>/dev/null | head -5)
+    else
+        echo -e "║ Δεν υπάρχουν ακόμα backups.                  ║"
+    fi
+
+    echo -e "${BOLD}╠══════════════════════════════════════════════╣${NC}"
+    echo -e "║  [b] Δημιούργησε backup τώρα                 ║"
+    echo -e "║  [r] Κάνε restore από backup                 ║"
+    echo -e "║  [c] Συνέχεια (χωρίς αλλαγή)                ║"
+    echo -e "${BOLD}╚══════════════════════════════════════════════╝${NC}"
+    echo ""
+    echo -ne "${BOLD}Επιλογή [b/r/c]: ${NC}"
+    read -r bm_choice
+
+    case "$bm_choice" in
+        b|B)
+            fstab_backup
+            ;;
+        r|R)
+            fstab_restore
+            ;;
+        c|C|"")
+            info "Συνεχίζω..."
+            ;;
+        *)
+            warn "Μη έγκυρη επιλογή. Συνεχίζω..."
+            ;;
+    esac
+}
+
+# ============================================================
+# ΒΗΜΑ 6: Auto-mount ΟΛΩΝ των δίσκων στο fstab
+# ============================================================
+setup_fstab_all() {
+    local current_user
+    current_user=$(logname)
+    local uid
+    uid=$(id -u "$current_user")
+    local gid
+    gid=$(id -g "$current_user")
+
+    echo ""
+    step "Σαρώνω όλους τους δίσκους για auto-mount..."
+
+    # Χρησιμοποιούμε το DISK_LIST από scan_disks (ήδη φιλτραρισμένο)
+    # Αν SELECT_ALL=false, χρησιμοποιούμε μόνο τον επιλεγμένο δίσκο
+    local source_list=()
+    if [[ "$SELECT_ALL" == true ]]; then
+        source_list=("${DISK_LIST[@]}")
+    else
+        source_list=("$SEL_NAME|$SEL_FSTYPE|$SEL_LABEL|$SEL_SIZE|$SEL_MOUNT")
+    fi
+
+    if [[ ${#source_list[@]} -eq 0 ]]; then
+        warn "Δεν βρέθηκαν δίσκοι για auto-mount."
+        return
+    fi
+
+    # Εμφάνισε λίστα
+    echo ""
+    echo -e "${BOLD}Δίσκοι που θα προστεθούν στο fstab:${NC}"
+    echo ""
+    local to_add=()
+    for entry in "${source_list[@]}"; do
+        IFS='|' read -r name fstype label size mountpoint <<< "$entry"
+        [[ -z "$label" ]] && label="-"
+
+        # Check: ήδη στο fstab (double-check);
+        if grep -q "/dev/$name" "$FSTAB" 2>/dev/null; then
+            printf "  ${YELLOW}[SKIP]${NC} /dev/%-10s %-6s %-15s %s (ήδη στο fstab)
+" "$name" "$fstype" "$label" "$size"
+            continue
+        fi
+
+        local clean_label
+        clean_label=$(echo "$label" | tr '[:upper:]' '[:lower:]' | tr ' ' '_' | tr -dc '[:alnum:]_-')
+        [[ -z "$clean_label" || "$clean_label" == "-" ]] && clean_label="$name"
+        local mpoint="/mnt/auto-${clean_label}"
+
+        printf "  ${GREEN}[ADD]${NC}  /dev/%-10s %-6s %-15s %s → %s
+" "$name" "$fstype" "$label" "$size" "$mpoint"
+        to_add+=("$name|$fstype|$label|$mpoint")
+    done
+
+    if [[ ${#to_add[@]} -eq 0 ]]; then
+        success "Όλοι οι δίσκοι είναι ήδη στο fstab."
+        return
+    fi
+
+    echo ""
+    echo -e "${YELLOW}Τι θα γίνει:${NC}"
+    echo -e "  - Backup του $FSTAB στο $BACKUP_DIR"
+    echo -e "  - Δημιουργία directories /mnt/auto-*"
+    echo -e "  - Προσθήκη ${#to_add[@]} δίσκων στο fstab με nofail"
+    echo -e "  - systemctl daemon-reload"
+    echo -e "  - Δοκιμαστικό mount για κάθε δίσκο"
+    echo ""
+    echo -ne "${BOLD}Συνεχίζω; [y/N]: ${NC}"
+    read -r answer
+
+    if ! [[ "$answer" =~ ^[Yy]$ ]]; then
+        warn "Ακυρώθηκε."
+        return
+    fi
+
+    # Backup ΠΡΙΝ οποιαδήποτε αλλαγή
+    fstab_backup
+
+    for entry in "${to_add[@]}"; do
+        IFS='|' read -r name fstype label mpoint <<< "$entry"
+
+        # Check: mount point directory;
+        if [[ ! -d "$mpoint" ]]; then
+            mkdir -p "$mpoint"
+            success "Directory: $mpoint δημιουργήθηκε."
+        fi
+
+        # Δημιουργία fstab γραμμής
+        local fstab_line
+        if [[ "$fstype" == "ntfs" ]]; then
+            fstab_line="/dev/$name  $mpoint  ntfs-3g  uid=$uid,gid=$gid,rw,nofail,x-systemd.automount  0  0"
+        else
+            fstab_line="/dev/$name  $mpoint  $fstype  defaults,nofail,x-systemd.automount  0  0"
+        fi
+
+        echo "$fstab_line" >> "$FSTAB"
+
+        # Check: γράφτηκε σωστά;
+        if grep -qF "$mpoint" "$FSTAB"; then
+            success "/dev/$name → $mpoint ✔"
+        else
+            error "/dev/$name → εγγραφή στο fstab απέτυχε ✘"
+        fi
+    done
+
+    # Reload systemd
+    systemctl daemon-reload
+    success "systemctl daemon-reload ολοκληρώθηκε."
+
+    # Δοκιμαστικό mount για κάθε νέο δίσκο
+    echo ""
+    step "Δοκιμαστικό mount για κάθε δίσκο..."
+    for entry in "${to_add[@]}"; do
+        IFS='|' read -r name fstype label mpoint <<< "$entry"
+        if mount "$mpoint" 2>/dev/null; then
+            success "Mount: $mpoint → OK ✔"
+        else
+            warn "Mount: $mpoint → απέτυχε (ίσως χρειάζεται reboot ή ο δίσκος δεν είναι συνδεδεμένος)"
+        fi
+    done
+}
+
+# ============================================================
+# ΒΗΜΑ 7: Επαλήθευση λειτουργίας
 # ============================================================
 verify_all() {
     echo ""
@@ -333,17 +716,16 @@ verify_all() {
 
     local all_ok=true
 
-    # Check 1: Mount point υπάρχει και έχει περιεχόμενο
-    if mountpoint -q "$MOUNT_POINT" 2>/dev/null; then
+    # Check 1: MOUNT_POINT ορισμένο και mounted;
+    if [[ -z "$MOUNT_POINT" ]]; then
+        warn "Κανένας επιλεγμένος δίσκος δεν έγινε mount — παραλείπω έλεγχο mount."
+    elif mountpoint -q "$MOUNT_POINT" 2>/dev/null; then
         success "Mount: $MOUNT_POINT → mounted ✔"
+    elif [[ -d "$MOUNT_POINT" ]]; then
+        success "Mount: $MOUNT_POINT → directory υπάρχει ✔"
     else
-        # Ίσως είναι ήδη mounted από GNOME (π.χ. /run/media/...)
-        if [[ -d "$MOUNT_POINT" ]]; then
-            success "Mount: $MOUNT_POINT → directory υπάρχει ✔"
-        else
-            error "Mount: $MOUNT_POINT → ΔΕΝ βρέθηκε ✘"
-            all_ok=false
-        fi
+        error "Mount: $MOUNT_POINT → ΔΕΝ βρέθηκε ✘"
+        all_ok=false
     fi
 
     # Check 2: qemu ACL
@@ -371,14 +753,18 @@ verify_all() {
         warn "qemu.conf: user γραμμή δεν βρέθηκε"
     fi
 
-    # Check 5: Δοκιμαστική εγγραφή
-    local testfile="$MOUNT_POINT/.kvm_write_test"
-    if touch "$testfile" 2>/dev/null; then
-        rm -f "$testfile"
-        success "Δοκιμαστική εγγραφή: $MOUNT_POINT → OK ✔"
+    # Check 5: Δοκιμαστική εγγραφή (μόνο αν MOUNT_POINT ορισμένο)
+    if [[ -n "$MOUNT_POINT" && -d "$MOUNT_POINT" ]]; then
+        local testfile="$MOUNT_POINT/.kvm_write_test"
+        if touch "$testfile" 2>/dev/null; then
+            rm -f "$testfile"
+            success "Δοκιμαστική εγγραφή: $MOUNT_POINT → OK ✔"
+        else
+            error "Δοκιμαστική εγγραφή: $MOUNT_POINT → ΑΠΟΤΥΧΙΑ ✘"
+            all_ok=false
+        fi
     else
-        error "Δοκιμαστική εγγραφή: $MOUNT_POINT → ΑΠΟΤΥΧΙΑ ✘"
-        all_ok=false
+        warn "Δοκιμαστική εγγραφή: παραλείπεται (δεν υπάρχει mounted δίσκος)."
     fi
 
     echo ""
@@ -390,7 +776,149 @@ verify_all() {
 }
 
 # ============================================================
-# ΒΗΜΑ 7: Τελική αναφορά
+# ΒΗΜΑ 9: Symlink Manager (Linux φάκελοι → άλλος δίσκος)
+# ============================================================
+symlink_manager() {
+    echo ""
+    echo -e "${BOLD}╔══════════════════════════════════════════════╗${NC}"
+    echo -e "${BOLD}║       Symlink Manager - Φάκελοι Linux        ║${NC}"
+    echo -e "${BOLD}╠══════════════════════════════════════════════╣${NC}"
+    echo -e "║  Μετακίνησε φακέλους Linux σε άλλο δίσκο    ║${NC}"
+    echo -e "${BOLD}╚══════════════════════════════════════════════╝${NC}"
+    echo ""
+
+    local current_user
+    current_user=$(logname)
+    local home_dir
+    home_dir=$(eval echo "~$current_user")
+
+    # Check: kdialog (KDE) ή zenity (GNOME) διαθέσιμο;
+    if ! command -v kdialog &>/dev/null && ! command -v zenity &>/dev/null; then
+        warn "Δεν βρέθηκε kdialog ή zenity."
+        echo -ne "${BOLD}Να εγκαταστήσω kdialog (KDE); [y/N]: ${NC}"
+        read -r inst
+        if [[ "$inst" =~ ^[Yy]$ ]]; then
+            dnf install -y kdialog &>/dev/null
+            if ! command -v kdialog &>/dev/null; then
+                error "Εγκατάσταση kdialog απέτυχε. Παραλείπω symlink manager."
+                return
+            fi
+            success "kdialog εγκαταστάθηκε."
+        else
+            warn "Παραλείπω symlink manager."
+            return
+        fi
+    fi
+    # Εμφάνισε ποιο tool θα χρησιμοποιηθεί
+    if command -v kdialog &>/dev/null; then
+        info "Χρησιμοποιώ: kdialog (Dolphin style)"
+    else
+        info "Χρησιμοποιώ: zenity (GNOME style)"
+    fi
+
+    echo -ne "${BOLD}Θέλεις να ρυθμίσεις symlinks φακέλων; [y/N]: ${NC}"
+    read -r do_symlink
+    [[ ! "$do_symlink" =~ ^[Yy]$ ]] && return
+
+    # Λίστα φακέλων
+    local folders=("Documents" "Music" "Pictures" "Videos" "Downloads")
+
+    for folder in "${folders[@]}"; do
+        local src="$home_dir/$folder"
+        echo ""
+        echo -e "${BOLD}--- $folder ---${NC}"
+
+        # Check: είναι ήδη symlink;
+        if [[ -L "$src" ]]; then
+            local current_target
+            current_target=$(readlink -f "$src")
+            warn "$folder είναι ήδη symlink → $current_target"
+            echo -ne "  Θέλεις να το αλλάξεις; [y/N]: "
+            read -r change_it
+            [[ ! "$change_it" =~ ^[Yy]$ ]] && continue
+        fi
+
+        echo -e "  Άνοιγμα file picker για τον προορισμό του ${CYAN}$folder${NC}..."
+        echo -e "  ${YELLOW}(Πλοηγήσου στον δίσκο σου και επέλεξε φάκελο)${NC}"
+
+        # Zenity file picker - ανοίγει στο /mnt αν υπάρχει
+        local start_dir="/mnt"
+        [[ ! -d "$start_dir" ]] && start_dir="/"
+
+        local dest
+        local uid_user
+        uid_user=$(id -u "$current_user")
+        local dbus_addr="unix:path=/run/user/${uid_user}/bus"
+
+        # Προσπάθησε kdialog πρώτα (KDE/Dolphin), μετά zenity (GNOME)
+        if command -v kdialog &>/dev/null; then
+            dest=$(sudo -u "$current_user"                 DISPLAY=:0                 DBUS_SESSION_BUS_ADDRESS="$dbus_addr"                 kdialog                 --getexistingdirectory "$start_dir"                 --title "Επέλεξε προορισμό για: $folder"                 2>/dev/null)
+        elif command -v zenity &>/dev/null; then
+            dest=$(sudo -u "$current_user"                 DISPLAY=:0                 DBUS_SESSION_BUS_ADDRESS="$dbus_addr"                 zenity --file-selection                 --directory                 --title="Επέλεξε προορισμό για: $folder"                 --filename="$start_dir/"                 2>/dev/null)
+        else
+            error "Δεν βρέθηκε kdialog ή zenity. Εγκατάστησε: dnf install kdialog"
+            warn "Παραλείπω $folder."
+            continue
+        fi
+
+        # Check: επιλέχθηκε path;
+        if [[ -z "$dest" ]]; then
+            warn "Δεν επιλέχθηκε φάκελος για $folder. Παραλείπω."
+            continue
+        fi
+
+        # Check: ο προορισμός υπάρχει ή να δημιουργηθεί;
+        local final_dest="$dest/$folder"
+        echo ""
+        echo -e "${YELLOW}Τι θα γίνει για $folder:${NC}"
+        echo -e "  1. Δημιουργία: ${CYAN}$final_dest${NC}"
+        if [[ -d "$src" && ! -L "$src" ]]; then
+            echo -e "  2. Αντιγραφή περιεχομένου: ${CYAN}$src${NC} → ${CYAN}$final_dest${NC}"
+            echo -e "  3. Διαγραφή αρχικού: ${CYAN}$src${NC}"
+        fi
+        echo -e "  4. Δημιουργία symlink: ${CYAN}$src${NC} → ${CYAN}$final_dest${NC}"
+        echo ""
+        echo -ne "${BOLD}Συνεχίζω; [y/N]: ${NC}"
+        read -r confirm
+
+        [[ ! "$confirm" =~ ^[Yy]$ ]] && warn "Παραλείπω $folder." && continue
+
+        # Δημιουργία προορισμού
+        mkdir -p "$final_dest"
+        chown "$current_user:$current_user" "$final_dest"
+
+        # Check: δημιουργήθηκε;
+        if [[ ! -d "$final_dest" ]]; then
+            error "Δεν μπόρεσα να δημιουργήσω: $final_dest"
+            continue
+        fi
+
+        # Αντιγραφή περιεχομένου αν υπάρχει αρχικός φάκελος (όχι symlink)
+        if [[ -d "$src" && ! -L "$src" ]]; then
+            if cp -r "$src/." "$final_dest/" 2>/dev/null; then
+                success "Αντιγραφή περιεχομένου: OK ✔"
+            else
+                warn "Αντιγραφή απέτυχε — ο προορισμός μπορεί να είναι κενός."
+            fi
+            rm -rf "$src"
+        elif [[ -L "$src" ]]; then
+            rm -f "$src"
+        fi
+
+        # Δημιουργία symlink
+        sudo -u "$current_user" ln -s "$final_dest" "$src"
+
+        # Check: symlink δημιουργήθηκε σωστά;
+        if [[ -L "$src" ]] && [[ "$(readlink -f "$src")" == "$final_dest" ]]; then
+            success "$folder → $final_dest ✔"
+        else
+            error "Symlink απέτυχε για $folder ✘"
+        fi
+    done
+}
+
+# ============================================================
+# ΒΗΜΑ 10: Τελική αναφορά
 # ============================================================
 final_report() {
     echo ""
@@ -398,9 +926,15 @@ final_report() {
     echo -e "${BOLD}║           ✅ Ολοκληρώθηκε                   ║${NC}"
     echo -e "${BOLD}╠══════════════════════════════════════════════╣${NC}"
     echo -e "║ Device    : ${CYAN}/dev/$SEL_NAME${NC}"
-    echo -e "║ Mount     : ${CYAN}$MOUNT_POINT${NC}"
+    if [[ -n "$MOUNT_POINT" ]]; then
+        echo -e "║ Mount     : ${CYAN}$MOUNT_POINT${NC}"
+    else
+        echo -e "║ Mount     : ${YELLOW}(παραλείφθηκε)${NC}"
+    fi
     echo -e "║ Τύπος     : ${CYAN}$SEL_FSTYPE${NC}"
     echo -e "${BOLD}╠══════════════════════════════════════════════╣${NC}"
+    echo -e "║ Backups αποθηκεύτηκαν στο:                  ║"
+    echo -e "║ ${CYAN}$BACKUP_DIR${NC}"
     echo -e "║ Στο virt-manager χρησιμοποίησε το path:     ║"
     echo -e "║ ${CYAN}$MOUNT_POINT${NC}"
     echo -e "${BOLD}╚══════════════════════════════════════════════╝${NC}"
@@ -421,10 +955,13 @@ check_root
 check_dependencies
 check_libvirtd
 check_qemu_user
+backup_menu
 scan_disks
 select_disk
 mount_disk
 set_kvm_permissions
 update_qemu_conf
+setup_fstab_all
+symlink_manager
 verify_all
 final_report
